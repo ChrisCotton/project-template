@@ -1,0 +1,144 @@
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels:
+    name: jenkins
+spec:
+  serviceName: jenkins
+  replicas: 1
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      name: jenkins
+      labels:
+        name: jenkins
+        app: jenkins
+    spec:
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: jenkins
+      initContainers:
+        - name: "install-plugins"
+          image: "jenkins/jenkins"
+          imagePullPolicy: "Always"
+          command: ["/bin/sh"]
+          args: ["-c", "rm -f /var/jenkins_home/plugins/failed-plugins.txt && rm -rf /var/jenkins_home/plugins/*.lock && /usr/local/bin/install-plugins.sh < /var/jenkins_config/plugins.txt"]
+          env:
+            - name: REF
+              value: /var/jenkins_home/plugins
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+              readOnly: false
+            - name: jenkins-config
+              mountPath: /var/jenkins_config
+              readOnly: true
+      containers:
+        - name: jenkins
+          image: jenkins/jenkins
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+            - containerPort: 50000
+          resources:
+            limits:
+              cpu: 4
+              memory: 8Gi
+            requests:
+              cpu: 2
+              memory: 4Gi
+          env:
+            - name: REF
+              value: /var/jenkins_home/plugins
+            - name: LIMITS_MEMORY
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+                  divisor: 1Mi
+            - name: JAVA_OPTS
+              value: -Xmx$(LIMITS_MEMORY)m -XshowSettings:vm -Dhudson.slaves.NodeProvisioner.initialDelay=0 -Dhudson.slaves.NodeProvisioner.MARGIN=50 -Dhudson.slaves.NodeProvisioner.MARGIN0=0.85 -Dorg.apache.commons.jelly.tags.fmt.timeZone=America/Los_Angeles
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+            - name: jenkins-config
+              mountPath: /var/jenkins_config
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 12 # ~2 minutes
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 12 # ~2 minutes
+        # This container scrapes the prometheus endpoint on Jenkins and pushes
+        # the metrics to Stackdriver
+        - name: prometheus-to-sd
+          image: gcr.io/pso-examples/prometheus-to-sd:v0.2.6
+          ports:
+            - name: profiler
+              containerPort: 6060
+          command:
+            # Do not add auto-whitelist-metrics unless you only want metrics
+            # already in Stackdriver to be used. The configuration as is
+            # pushes everything to Stackdriver
+            - /monitor
+            - --stackdriver-prefix=custom.googleapis.com
+            - --source=jenkins:http://localhost:8080/prometheus/
+            - --pod-id=$(POD_NAME)
+            - --namespace-id=$(POD_NAMESPACE)
+            # To turn on debug logging, uncomment the following line:
+            # - -v=10
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          securityContext:
+            runAsUser: 0
+      volumes:
+      - name: jenkins-config
+        configMap:
+          name: jenkins-configmap
+      securityContext:
+        fsGroup: 1000
+  volumeClaimTemplates:
+  - metadata:
+      name: jenkins-home
+    spec:
+      storageClassName: repd-fast
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 50Gi
+
